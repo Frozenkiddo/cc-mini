@@ -10,12 +10,18 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from prompt_toolkit import PromptSession
+from prompt_toolkit.application import Application as PTApp
+from prompt_toolkit.application.current import get_app
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.styles import Style as PTStyle
+from prompt_toolkit.layout import Layout
+from prompt_toolkit.layout.containers import HSplit, Window, FloatContainer, Float
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.menus import CompletionsMenu
 from rich.console import Console
 from rich.live import Live
 from rich.spinner import Spinner
@@ -121,6 +127,118 @@ class _SlashCommandCompleter(Completer):
 
 
 _slash_completer = _SlashCommandCompleter()
+
+
+# ---------------------------------------------------------------------------
+# Bordered input prompt — matches claude-code-main PromptInput.tsx
+# borderStyle="round", borderLeft=false, borderRight=false
+# Uses a custom prompt_toolkit Application so the bottom border sits
+# directly below the input content (not at the screen bottom).
+# ---------------------------------------------------------------------------
+
+def _bordered_prompt(
+    con: Console,
+    history: FileHistory | None = None,
+    completer: Completer | None = None,
+    animator_toolbar=None,
+    refresh_interval: float | None = None,
+) -> str:
+    """Prompt with bordered input box that adapts to content height.
+
+    Raises KeyboardInterrupt on Ctrl+C, EOFError on Ctrl+D with empty buffer.
+    """
+    import os
+
+    def _accept(b):
+        get_app().exit(result=b.text)
+        return True  # keep text in buffer so final render preserves input
+
+    buf = Buffer(
+        history=history,
+        completer=completer,
+        complete_while_typing=True,
+        accept_handler=_accept,
+    )
+
+    def _top():
+        try:
+            w = os.get_terminal_size().columns
+        except OSError:
+            w = 80
+        label = "\u2500\u2500 Human "
+        fill = "\u2500" * max(0, w - 1 - len(label))
+        return [('bold fg:ansicyan', f'\u256d{label}{fill}')]
+
+    def _bot():
+        try:
+            w = os.get_terminal_size().columns
+        except OSError:
+            w = 80
+        hints = "\u2500 Enter send \u00b7 Alt+Enter newline \u00b7 /help "
+        fill = "\u2500" * max(0, w - 1 - len(hints))
+        parts: list[tuple[str, str]] = [('fg:ansicyan', f'\u2570{hints}{fill}')]
+        if animator_toolbar:
+            extra = animator_toolbar()
+            if extra:
+                parts.append(('', '\n'))
+                parts.extend(extra)
+        return parts
+
+    def _line_prefix(lineno, wrap_count):
+        """First visual line gets '> ', all others get '  ' padding."""
+        if lineno == 0 and wrap_count == 0:
+            return [('bold fg:ansicyan', '> ')]
+        return [('', '  ')]
+
+    body = HSplit([
+        Window(FormattedTextControl(_top), height=1, dont_extend_height=True),
+        Window(
+            BufferControl(buffer=buf),
+            get_line_prefix=_line_prefix,
+            height=Dimension(min=1),
+            dont_extend_height=True,
+            wrap_lines=True,
+        ),
+        Window(FormattedTextControl(_bot), dont_extend_height=True),
+    ])
+
+    root = FloatContainer(
+        content=body,
+        floats=[
+            Float(
+                xcursor=True, ycursor=True,
+                content=CompletionsMenu(max_height=8, scroll_offset=1),
+            ),
+        ],
+    )
+
+    kb = KeyBindings()
+
+    @kb.add('enter')
+    def _(event):
+        buf.validate_and_handle()
+
+    @kb.add('escape', 'enter')
+    def _(event):
+        buf.insert_text('\n')
+
+    @kb.add('c-c')
+    def _(event):
+        event.app.exit(exception=KeyboardInterrupt())
+
+    @kb.add('c-d')
+    def _(event):
+        if not buf.text:
+            event.app.exit(exception=EOFError())
+
+    app = PTApp(
+        layout=Layout(root),
+        key_bindings=kb,
+        full_screen=False,
+        refresh_interval=refresh_interval,
+    )
+    app.layout.focus(buf)
+    return app.run()
 
 
 def _tool_preview(tool_name: str, tool_input: dict) -> str:
@@ -417,22 +535,10 @@ def main() -> None:
     config_note = f"[dim]{app_config.model} · max_tokens={app_config.max_tokens}[/dim]"
     session_note = f"[dim]session {session_store.session_id[:8]}[/dim]" if session_store else ""
     console.print("[bold cyan]cc-mini[/bold cyan]  "
-                  f"{config_note}  {session_note}  "
-                  "[dim]Esc or Ctrl+C to cancel, Ctrl+C twice to exit[/dim]")
-    console.print('[dim]Enter to send, Alt+Enter for newline, /help for commands[/dim]\n')
+                  f"{config_note}  {session_note}")
+    console.print('[dim]Esc or Ctrl+C to cancel, Ctrl+C twice to exit[/dim]')
 
-    kb = KeyBindings()
-
-    @kb.add("escape", "enter")
-    def _(event):
-        event.current_buffer.insert_text("\n")
-
-    session: PromptSession = PromptSession(
-        history=FileHistory(str(_HISTORY_FILE)),
-        key_bindings=kb,
-        completer=_slash_completer,
-        complete_while_typing=True,
-    )
+    _file_history = FileHistory(str(_HISTORY_FILE))
 
     # Track last Ctrl+C time for double-press exit (matches useDoublePress)
     last_ctrlc_time = 0.0
@@ -450,12 +556,6 @@ def main() -> None:
                 animator = CompanionAnimator(comp)
     except Exception:
         pass
-
-    def _bottom_toolbar():
-        """Return animated companion sprite for bottom_toolbar."""
-        if animator is None:
-            return None
-        return animator.toolbar_text()
 
     def _set_reaction(text: str, print_to_terminal: bool = False) -> None:
         """Observer callback — delivers reaction to animator's toolbar bubble.
@@ -500,17 +600,13 @@ def main() -> None:
         try:
             if animator:
                 animator.start()
-            # Override default bottom-toolbar reverse-video background
-            # so sprite and bubble render with normal terminal colors
-            _toolbar_style = PTStyle.from_dict({
-                'bottom-toolbar': 'noreverse',
-                'bottom-toolbar.text': '',
-            })
-            user_input = session.prompt(
-                "\n> ",
-                bottom_toolbar=_bottom_toolbar if animator else None,
+            console.print()
+            user_input = _bordered_prompt(
+                console,
+                history=_file_history,
+                completer=_slash_completer,
+                animator_toolbar=animator.toolbar_text if animator else None,
                 refresh_interval=0.5 if animator else None,
-                style=_toolbar_style if animator else None,
             ).strip()
         except KeyboardInterrupt:
             now = time.monotonic()
