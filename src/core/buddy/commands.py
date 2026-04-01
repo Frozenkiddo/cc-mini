@@ -246,4 +246,3 @@ def handle_buddy_command(
         console.print(
             '[dim]Usage: /buddy [pet|stats|new|list|select N|mute|unmute|ia][/dim]'
           )
-        )
