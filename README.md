@@ -22,6 +22,7 @@ Compatible with **Anthropic** and **OpenAI** APIs &nbsp;·&nbsp; **Agentic** &nb
 
 | Feature | What it does |
 |---------|--------------|
+| [**Coordinator Mode**](#coordinator-mode) | Runs the assistant as a coordinator that can launch background workers, continue them later, and synthesize their results |
 | [**Buddy**](#buddy--ai-companion) | Tamagotchi-style AI companion pet — watches your sessions, comments in a speech bubble, has persistent personality and stats |
 | [**KAIROS**](#kairos--memory-system) | Cross-session memory system — save notes, auto-consolidates logs into topic files over time |
 | [**Sandbox**](#sandbox) | Runs bash commands inside bubblewrap (bwrap) isolation — filesystem writes and network access restricted |
@@ -33,6 +34,7 @@ Compatible with **Anthropic** and **OpenAI** APIs &nbsp;·&nbsp; **Agentic** &nb
 - **6 built-in tools**: `Read`, `Edit`, `Write`, `Glob`, `Grep`, `Bash`
 - **Permission system** — reads auto-approved; writes and bash commands ask for confirmation
 - **Conversation management** — session persistence, context compression, and resume support
+- **Coordinator mode** — optional orchestration mode with background workers for parallel research, implementation, and verification
 - **Skills** — reusable one-command workflows via `SKILL.md` files, built-in and custom
 
 ---
@@ -40,7 +42,7 @@ Compatible with **Anthropic** and **OpenAI** APIs &nbsp;·&nbsp; **Agentic** &nb
 ## Requirements
 
 - Python 3.10+ (3.11+ recommended)
-- [Anthropic API key](https://console.anthropic.com/)
+- Anthropic-compatible or OpenAI-compatible API access
 - Linux with [bubblewrap](https://github.com/containers/bubblewrap) (`apt install bubblewrap`) — only for sandbox support (optional)
 
 ---
@@ -85,6 +87,8 @@ pip install -e ".[dev]"
 
 ### Set API key
 
+Anthropic-compatible setup:
+
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
@@ -95,11 +99,21 @@ Custom API base URL (useful for proxies or compatible endpoints):
 export ANTHROPIC_BASE_URL=https://your-gateway.example.com
 ```
 
+OpenAI-compatible setup:
+
+```bash
+export CC_MINI_PROVIDER=openai
+export OPENAI_API_KEY=sk-...
+export OPENAI_BASE_URL=https://your-openai-gateway.example.com
+```
+
 Optional environment variables for runtime defaults:
 
 ```bash
 export CC_MINI_MODEL=claude-sonnet-4-5
 export CC_MINI_MAX_TOKENS=64000
+export CC_MINI_EFFORT=medium
+export CC_MINI_BUDDY_MODEL=claude-haiku-4-5-20251001
 ```
 
 ### Interactive REPL
@@ -121,6 +135,23 @@ The submit() method implements an agentic loop...
 ```
 
 Type `exit` or press `Ctrl+C` to quit.
+
+### Coordinator mode
+
+Launch cc-mini in coordinator mode:
+
+```bash
+cc-mini --coordinator
+```
+
+Or enable it via environment variable:
+
+```bash
+export CC_MINI_COORDINATOR=1
+cc-mini
+```
+
+In coordinator mode, the assistant can use background workers through the `Agent`, `SendMessage`, and `TaskStop` tools. Worker results are delivered back into the main conversation as internal `<task-notification>` messages, so interactive mode is the best fit.
 
 ### One-shot prompt
 
@@ -154,6 +185,7 @@ cc-mini --auto-approve
 
 ```bash
 cc-mini \
+  --provider anthropic \
   --base-url https://your-gateway.example.com \
   --api-key sk-ant-... \
   --model claude-sonnet-4
@@ -163,6 +195,27 @@ cc-mini \
 
 ```bash
 cc-mini --model claude-3-5-haiku --max-tokens 2048
+```
+
+OpenAI-compatible example:
+
+```bash
+cc-mini \
+  --provider openai \
+  --base-url https://your-openai-gateway.example.com/v1 \
+  --api-key sk-... \
+  --model gpt-4.1-mini \
+  --effort medium
+```
+
+For quick testing, you can also use an OpenAI-compatible gateway such as OpenRouter with a free model:
+
+```bash
+cc-mini \
+  --provider openai \
+  --base-url https://openrouter.ai/api/v1 \
+  --api-key sk-or-... \
+  --model qwen/qwen3.6-plus-preview:free
 ```
 
 ### Configure with a TOML file
@@ -175,20 +228,36 @@ Config files are loaded in order (later overrides earlier):
 Point to a specific file with `--config`.
 
 ```toml
+provider = "anthropic"  # or "openai"
+
 [anthropic]
 api_key = "sk-ant-..."
 base_url = "https://your-gateway.example.com"
 model = "claude-sonnet-4"
+
+[openai]
+api_key = "sk-..."
+base_url = "https://your-openai-gateway.example.com/v1"
+model = "gpt-4.1-mini"
+max_tokens = 8192
+effort = "medium"
+buddy_model = "gpt-4.1-mini"
 ```
 
-Top-level keys are also supported:
+OpenRouter example for low-cost testing:
 
 ```toml
-api_key = "sk-ant-..."
-base_url = "https://your-gateway.example.com"
-model = "claude-3-7-sonnet"
-max_tokens = 64000
+provider = "openai"
+
+[openai]
+api_key = "sk-or-..."
+base_url = "https://openrouter.ai/api/v1"
+model = "qwen/qwen3.6-plus-preview:free"
 ```
+
+Top-level keys are also supported and override the selected provider section when present.
+
+When `provider = "openai"`, `OPENAI_API_KEY` / `OPENAI_BASE_URL` are used. When `provider = "anthropic"`, `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` are used. If `buddy_model` is omitted, Anthropic defaults to Haiku for companion side-features; OpenAI defaults to the main model so companion features do not break on unknown model names.
 
 ---
 
@@ -202,6 +271,9 @@ max_tokens = 64000
 | Edit file | `Edit` | requires confirmation |
 | Write file | `Write` | requires confirmation |
 | Run command | `Bash` | requires confirmation |
+| Spawn background worker (coordinator mode) | `Agent` | requires confirmation |
+| Continue background worker (coordinator mode) | `SendMessage` | requires confirmation |
+| Stop background worker (coordinator mode) | `TaskStop` | requires confirmation |
 
 ### Permission prompt
 
@@ -227,6 +299,8 @@ cc-mini automatically saves conversations and can compress long contexts to stay
 ### Session Persistence
 
 Every conversation is saved as a JSONL file under `~/.mini-claude/sessions/`. Messages are appended incrementally — nothing is lost even if the process crashes.
+
+Session metadata also stores whether the conversation was started in normal mode or coordinator mode. When you resume a saved session, cc-mini restores that mode automatically.
 
 ```bash
 # Resume a previous session by index or ID
@@ -266,6 +340,42 @@ How it works:
 | `/history` | List saved sessions for this directory |
 | `/clear` | Clear conversation, start a new session |
 | `/skills` | List all available skills |
+
+---
+
+## Coordinator Mode
+
+> This feature exists in the official Claude Code codebase but has not been fully released by Anthropic. cc-mini implements and ships it.
+
+Coordinator mode turns the main assistant into an orchestrator. Instead of doing every substantial step itself, it can launch background workers to research the codebase, implement targeted changes, or verify work in parallel.
+
+### What it adds
+
+- **Background workers** — launch a worker and keep talking in the main session while it runs
+- **Continuation flow** — continue a completed worker later with more specific instructions
+- **Task notifications** — worker completions are injected back into the main conversation as structured `<task-notification>` messages
+- **Session-aware resume** — resumed sessions automatically restore coordinator mode when needed
+
+### Worker tools
+
+| Tool | Purpose |
+|------|---------|
+| `Agent` | Spawn a background worker with a self-contained prompt |
+| `SendMessage` | Continue an existing worker by task ID |
+| `TaskStop` | Stop a running worker |
+
+### Typical workflow
+
+1. Start `cc-mini --coordinator`
+2. Ask for a larger task such as researching a bug, implementing a fix, or verifying a change
+3. The coordinator launches one or more workers in the background
+4. As workers finish, their results arrive as `<task-notification>` messages
+5. The coordinator synthesizes those results and decides the next step
+
+### Notes
+
+- Workers currently use the standard file/code tools: `Read`, `Glob`, `Grep`, `Edit`, `Write`, and `Bash`
+- Worker execution is asynchronous, so coordinator mode is most useful in the interactive REPL
 
 ---
 
@@ -429,11 +539,37 @@ cc-mini includes **Buddy**, a Tamagotchi-style AI companion that lives in your t
 ### How it works
 
 - **18 species**: duck, goose, blob, cat, dragon, octopus, owl, penguin, turtle, snail, ghost, axolotl, capybara, cactus, robot, rabbit, mushroom, chonk
+- **Bonus species**: pikachu (braille dot-matrix art) — only available via seed, see below
 - **5 rarities**: Common (60%), Uncommon (25%), Rare (10%), Epic (4%), Legendary (1%) — plus 1% shiny chance
 - **5 stats** (0–100): Debugging, Patience, Chaos, Wisdom, Snark — these shape how your companion talks
 - **ASCII sprite** with idle animation (blinking, fidgeting) in the terminal toolbar
 - **Automatic reactions**: after each Claude response, your companion comments in a speech bubble
 - **Direct conversation**: address your companion by name and it replies (with conversation memory)
+
+### Use a specific buddy (Pikachu)
+
+You can override the default buddy seed with `CC_MINI_BUDDY_SEED`. Set it to a seed containing "pikachu" to unlock the hidden Pikachu companion (braille dot-matrix art):
+
+```bash
+export CC_MINI_BUDDY_SEED=pikachu-3361
+cc-mini
+> /buddy
+```
+
+| Rarity | Seed |
+|--------|------|
+| Common ★ | `pikachu-21` |
+| Uncommon ★★ | `pikachu-116` |
+| Rare ★★★ | `pikachu-430` |
+| Epic ★★★★ | `pikachu-488` |
+| Legendary ★★★★★ | `pikachu-3361` |
+
+To go back to the default buddy:
+
+```bash
+unset CC_MINI_BUDDY_SEED
+cc-mini
+```
 
 ### Example
 
@@ -450,6 +586,40 @@ Found the issue — off-by-one error in the loop...
 ```
 
 The companion's personality is generated by Claude on first hatch and persists permanently. Stats influence behavior: high Snark = sarcastic, high Patience = supportive, high Chaos = unpredictable.
+
+### Custom Species
+
+You can add your own species with custom ASCII art. Place a JSON file in `~/.cc-mini/buddy/species/` or `<project>/.cc-mini/buddy/species/`:
+
+```json
+{
+  "name": "pikachu",
+  "frames": [
+    [
+      "   \\\\  //    ",
+      "   (\\\\(//    ",
+      "  / {E}  {E} \\  ",
+      "  |  __  |  ",
+      "   \\____/   "
+    ],
+    [
+      "   ))  ((    ",
+      "   (\\\\(//    ",
+      "  / {E}  {E} \\  ",
+      "  |  __  |  ",
+      "   \\____/   "
+    ]
+  ],
+  "face": "({E}v{E})"
+}
+```
+
+- `{E}` is replaced with the companion's eye character at runtime
+- Each frame is 5 lines tall, ~12 chars wide
+- Provide 2-3 frames for idle animation variety
+- The `face` field is used for the compact one-liner display
+
+Custom species are added to the roll pool. Set `CC_MINI_BUDDY_SEED` to control which companion you get.
 
 ---
 
@@ -575,17 +745,19 @@ Dependency errors:
 
 ```
 src/core/
-├── main.py           # CLI entry point + REPL
+├── main.py           # CLI entry point + REPL + coordinator mode wiring
 ├── engine.py         # Streaming API loop + tool execution
 ├── context.py        # System prompt builder (git status, date, memory)
+├── coordinator.py    # Coordinator mode flags, prompts, and session-mode matching
 ├── config.py         # Configuration (CLI, env, TOML)
-├── commands.py       # Slash command system + skill dispatch
-├── session.py        # Session persistence (JSONL)
+├── commands.py       # Slash command system + skill dispatch + resume handling
+├── session.py        # Session persistence (JSONL + session mode metadata)
 ├── compact.py        # Context window compaction
 ├── skills.py         # Skill loader, registry, and discovery
 ├── skills_bundled.py # Built-in skills (simplify, review, commit, test)
 ├── memory.py         # KAIROS memory system (logs, dream, sessions)
 ├── permissions.py    # Permission checker + sandbox auto-allow
+├── worker_manager.py # Background worker lifecycle + task notifications
 ├── _keylistener.py   # Esc/Ctrl+C detection
 ├── sandbox/          # Sandbox subsystem (bwrap isolation)
 │   ├── config.py         # SandboxConfig dataclass + TOML persistence
@@ -600,7 +772,8 @@ src/core/
 │   ├── file_write.py
 │   ├── glob_tool.py
 │   ├── grep_tool.py
-│   └── bash.py       # Bash tool with sandbox integration
+│   ├── bash.py       # Bash tool with sandbox integration
+│   └── agent.py      # Coordinator-only tools: Agent, SendMessage, TaskStop
 └── buddy/
     ├── types.py      # Data model: species, rarity, stats
     ├── companion.py  # Mulberry32 PRNG + deterministic generation

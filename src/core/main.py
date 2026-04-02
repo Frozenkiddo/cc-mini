@@ -10,18 +10,33 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from prompt_toolkit import PromptSession
+from prompt_toolkit.application import Application as PTApp
+from prompt_toolkit.application.current import get_app
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.styles import Style as PTStyle
+from prompt_toolkit.layout import Layout
+from prompt_toolkit.layout.containers import HSplit, Window, FloatContainer, Float
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.menus import CompletionsMenu
 from rich.console import Console
 from rich.live import Live
 from rich.spinner import Spinner
 from rich.text import Text
 
 from .config import load_app_config
+from .coordinator import (
+    current_session_mode,
+    get_coordinator_system_prompt,
+    get_coordinator_user_context,
+    get_worker_system_prompt,
+    is_coordinator_mode,
+    match_session_mode,
+    set_coordinator_mode,
+)
 from .context import build_system_prompt
 from .cost_tracker import CostTracker
 from .engine import AbortedError, Engine
@@ -33,12 +48,14 @@ from .permissions import PermissionChecker
 from .sandbox.config import load_sandbox_config
 from .sandbox.manager import SandboxManager
 from .tools.ask_user import AskUserQuestionTool
+from .tools.agent import AgentTool, SendMessageTool, TaskStopTool
 from .tools.bash import BashTool
 from .tools.file_edit import FileEditTool
 from .tools.file_read import FileReadTool
 from .tools.file_write import FileWriteTool
 from .tools.glob_tool import GlobTool
 from .tools.grep_tool import GrepTool
+from .worker_manager import WorkerManager
 from .memory import (
     ensure_memory_dir,
     extract_memory_tags,
@@ -77,11 +94,15 @@ class _SlashCommandCompleter(Completer):
         ('cost',    'Show token usage and cost summary'),
         ('model',   'Show or switch model'),
         ('skills',  'List all available skills'),
-        ('buddy',   'Companion pet — hatch, pet, stats, mute/unmute'),
-        ('buddy pet',   'Pet your companion'),
-        ('buddy stats', 'Show companion stats'),
-        ('buddy mute',  'Mute companion reactions'),
-        ('buddy unmute', 'Unmute companion reactions'),
+        ('buddy',            'Companion pet — hatch, pet, stats, mute/unmute, ia'),
+        ('buddy pet',        'Pet your companion'),
+        ('buddy stats',      'Show companion stats'),
+        ('buddy new',        'Hatch a new random companion'),
+        ('buddy list',       'View all companions'),
+        ('buddy select',     'Switch active companion (e.g. /buddy select 2)'),
+        ('buddy mute',       'Mute companion reactions'),
+        ('buddy unmute',     'Unmute companion reactions'),
+        ('buddy ia',         'Idle Adventure — roguelike world exploration game'),
         ('exit',    'Exit the REPL'),
     ]
 
@@ -121,6 +142,171 @@ class _SlashCommandCompleter(Completer):
 
 
 _slash_completer = _SlashCommandCompleter()
+
+
+# ---------------------------------------------------------------------------
+# Bordered input prompt — matches claude-code-main PromptInput.tsx
+# borderStyle="round", borderLeft=false, borderRight=false
+# Uses a custom prompt_toolkit Application so the bottom border sits
+# directly below the input content (not at the screen bottom).
+# ---------------------------------------------------------------------------
+
+def _bordered_prompt(
+    con: Console,
+    history: FileHistory | None = None,
+    completer: Completer | None = None,
+    animator_toolbar=None,
+    refresh_interval: float | None = None,
+    terminal_mode_ref: list | None = None,
+) -> str:
+    """Prompt with bordered input box that adapts to content height.
+
+    terminal_mode_ref is a mutable [bool] list so '!' can toggle it in-place.
+
+    Raises KeyboardInterrupt on Ctrl+C, EOFError on Ctrl+D with empty buffer.
+    """
+    import os
+
+    if terminal_mode_ref is None:
+        terminal_mode_ref = [False]
+
+    def _is_terminal():
+        return terminal_mode_ref[0]
+
+    def _accept(b):
+        get_app().exit(result=b.text)
+        return True  # keep text in buffer so final render preserves input
+
+    buf = Buffer(
+        history=history,
+        completer=completer,
+        complete_while_typing=False,
+        accept_handler=_accept,
+    )
+
+    def _trigger_completion_next_tick():
+        """Schedule start_completion on the next event-loop tick.
+
+        This avoids the race with prompt_toolkit's internal completion reset
+        that happens synchronously during text insertion.
+        """
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            loop.call_soon(lambda: buf.start_completion(select_first=False))
+        except RuntimeError:
+            pass
+
+    def _on_text_changed(_buf):
+        """Trigger completion popup when input starts with '/'."""
+        if _buf.text.lstrip().startswith('/'):
+            _trigger_completion_next_tick()
+
+    buf.on_text_changed += _on_text_changed
+
+    def _top():
+        try:
+            w = os.get_terminal_size().columns
+        except OSError:
+            w = 80
+        fill = "\u2500" * max(0, w - 1)
+        if _is_terminal():
+            return [('bold fg:ansiyellow', f'\u256d{fill}')]
+        return [('bold fg:ansicyan', f'\u256d{fill}')]
+
+    def _bot():
+        try:
+            w = os.get_terminal_size().columns
+        except OSError:
+            w = 80
+        if _is_terminal():
+            hints = "\u2500 TERMINAL MODE \u00b7 ! to exit \u00b7 Enter run "
+            fill = "\u2500" * max(0, w - 1 - len(hints))
+            parts: list[tuple[str, str]] = [('fg:ansiyellow', f'\u2570{hints}{fill}')]
+        else:
+            hints = "\u2500 Enter send \u00b7 Alt+Enter newline \u00b7 ! shell \u00b7 / commands "
+            fill = "\u2500" * max(0, w - 1 - len(hints))
+            parts: list[tuple[str, str]] = [('fg:ansicyan', f'\u2570{hints}{fill}')]
+
+        if animator_toolbar:
+            extra = animator_toolbar()
+            if extra:
+                parts.append(('', '\n'))
+                parts.extend(extra)
+        return parts
+
+    def _line_prefix(lineno, wrap_count):
+        """First visual line gets '> ' or '$ ', all others get '  ' padding."""
+        if lineno == 0 and wrap_count == 0:
+            if _is_terminal():
+                return [('bold fg:ansiyellow', '$ ')]
+            return [('bold fg:ansicyan', '> ')]
+        return [('', '  ')]
+
+    body = HSplit([
+        Window(FormattedTextControl(_top), height=1, dont_extend_height=True),
+        Window(
+            BufferControl(buffer=buf),
+            get_line_prefix=_line_prefix,
+            height=Dimension(min=1),
+            dont_extend_height=True,
+            wrap_lines=True,
+        ),
+        Window(FormattedTextControl(_bot), dont_extend_height=True),
+    ])
+
+    root = FloatContainer(
+        content=body,
+        floats=[
+            Float(
+                xcursor=True, ycursor=True,
+                content=CompletionsMenu(max_height=8, scroll_offset=1),
+            ),
+        ],
+    )
+
+    kb = KeyBindings()
+
+    @kb.add('!')
+    def _(event):
+        if not buf.text:
+            # Toggle terminal mode in-place, no submit
+            terminal_mode_ref[0] = not terminal_mode_ref[0]
+            event.app.invalidate()  # force UI refresh for color change
+        else:
+            buf.insert_text('!')
+
+    @kb.add('enter')
+    def _(event):
+        # Feature: backslash + Enter = newline continuation
+        # Check at key-binding level to avoid buffer.reset() clearing text
+        if buf.text.endswith('\\'):
+            buf.delete_before_cursor(1)
+            buf.insert_text('\n')
+        else:
+            buf.validate_and_handle()
+
+    @kb.add('escape', 'enter')
+    def _(event):
+        buf.insert_text('\n')
+
+    @kb.add('c-c')
+    def _(event):
+        event.app.exit(exception=KeyboardInterrupt())
+
+    @kb.add('c-d')
+    def _(event):
+        if not buf.text:
+            event.app.exit(exception=EOFError())
+
+    app = PTApp(
+        layout=Layout(root),
+        key_bindings=kb,
+        full_screen=False,
+        refresh_interval=refresh_interval,
+    )
+    app.layout.focus(buf)
+    return app.run()
 
 
 def _tool_preview(tool_name: str, tool_input: dict) -> str:
@@ -310,11 +496,17 @@ def main() -> None:
     parser.add_argument("--auto-approve", action="store_true",
                         help="Auto-approve all tool permissions (dangerous)")
     parser.add_argument("--config", help="Path to a TOML config file")
-    parser.add_argument("--api-key", help="Anthropic API key")
-    parser.add_argument("--base-url", help="Anthropic-compatible API base URL")
+    parser.add_argument("--provider", choices=("anthropic", "openai"),
+                        help="API provider / wire format")
+    parser.add_argument("--api-key", help="API key for the selected provider")
+    parser.add_argument("--base-url", help="Custom API base URL for the selected provider")
     parser.add_argument("--model", help="Model name, e.g. claude-sonnet-4")
     parser.add_argument("--max-tokens", type=int,
                         help="Maximum output tokens for each model response")
+    parser.add_argument("--effort", choices=("low", "medium", "high"),
+                        help="Optional reasoning effort for supported OpenAI models")
+    parser.add_argument("--buddy-model",
+                        help="Override the model used by buddy / companion side-features")
     parser.add_argument("--resume", metavar="SESSION",
                         help="Resume a previous session (id or index)")
     parser.add_argument("--memory-dir", help="Override memory directory path")
@@ -324,6 +516,8 @@ def main() -> None:
                         help="Hours between auto-dream runs (default: 24)")
     parser.add_argument("--dream-min-sessions", type=int,
                         help="Minimum new sessions before auto-dream triggers (default: 5)")
+    parser.add_argument("--coordinator", action="store_true",
+                        help="Enable coordinator mode with background workers")
     args = parser.parse_args()
 
     try:
@@ -346,38 +540,108 @@ def main() -> None:
     discover_skills(cwd)
     skills_section = build_skills_prompt_section()
 
-    tools = [
-        FileReadTool(), GlobTool(), GrepTool(),
-        FileEditTool(), FileWriteTool(),
-        BashTool(sandbox_manager=sandbox_mgr),
-        AskUserQuestionTool(),
-    ]
-    system_prompt = build_system_prompt(memory_dir=memory_dir)
-    if skills_section:
-        system_prompt += "\n\n" + skills_section
+    if args.coordinator:
+        set_coordinator_mode(True)
+
+    def _build_base_tools() -> list:
+        return [
+            FileReadTool(), GlobTool(), GrepTool(),
+            FileEditTool(), FileWriteTool(),
+            BashTool(sandbox_manager=sandbox_mgr),
+        ]
+
+    worker_tool_names = [tool.name for tool in _build_base_tools()]
+
+    def _build_system_prompt_for_mode(coordinator_enabled: bool) -> str:
+        prompt = build_system_prompt(cwd=cwd, memory_dir=memory_dir)
+        if skills_section:
+            prompt += "\n\n" + skills_section
+        if coordinator_enabled:
+            extra = get_coordinator_user_context(worker_tool_names)
+            worker_context = extra.get("workerToolsContext")
+            if worker_context:
+                prompt += "\n\n# Coordinator Context\n" + worker_context
+            prompt += "\n\n" + get_coordinator_system_prompt()
+        return prompt
+
     permissions = PermissionChecker(
         auto_approve=args.auto_approve,
         sandbox_manager=sandbox_mgr,
     )
 
+    def _build_worker_engine() -> Engine:
+        worker_permissions = PermissionChecker(
+            auto_approve=True,
+            sandbox_manager=sandbox_mgr,
+        )
+        worker_prompt = build_system_prompt(cwd=cwd, memory_dir=memory_dir)
+        if skills_section:
+            worker_prompt += "\n\n" + skills_section
+        worker_prompt += "\n\n" + get_worker_system_prompt()
+        return Engine(
+            tools=_build_base_tools(),
+            system_prompt=worker_prompt,
+            permission_checker=worker_permissions,
+            provider=app_config.provider,
+            api_key=app_config.api_key,
+            base_url=app_config.base_url,
+            model=app_config.model,
+            max_tokens=app_config.max_tokens,
+            effort=app_config.effort,
+        )
+
+    worker_manager = WorkerManager(build_worker_engine=_build_worker_engine)
+
+    def _build_tools_for_mode(coordinator_enabled: bool) -> list:
+        tools = _build_base_tools()
+        tools.append(AskUserQuestionTool())
+        if coordinator_enabled:
+            tools.extend([
+                AgentTool(worker_manager),
+                SendMessageTool(worker_manager),
+                TaskStopTool(worker_manager),
+            ])
+        return tools
+
+    coordinator_enabled = is_coordinator_mode()
+
     # Session & compact services
     cost_tracker = CostTracker()
     session_store: SessionStore | None = None
     if not args.print:
-        session_store = SessionStore(cwd=cwd, model=app_config.model)
+        session_store = SessionStore(
+            cwd=cwd,
+            model=app_config.model,
+            mode=current_session_mode(),
+        )
 
     engine = Engine(
-        tools=tools,
-        system_prompt=system_prompt,
+        tools=_build_tools_for_mode(coordinator_enabled),
+        system_prompt=_build_system_prompt_for_mode(coordinator_enabled),
         permission_checker=permissions,
+        provider=app_config.provider,
         api_key=app_config.api_key,
         base_url=app_config.base_url,
         model=app_config.model,
         max_tokens=app_config.max_tokens,
+        effort=app_config.effort,
         session_store=session_store,
         cost_tracker=cost_tracker,
     )
-    compact_service = CompactService(client=engine._client, model=app_config.model)
+    compact_service = CompactService(
+        client=engine._client,
+        model=app_config.model,
+        effort=app_config.effort,
+    )
+
+    def _apply_session_mode(session_mode: str | None) -> str | None:
+        warning = match_session_mode(session_mode)
+        enabled = is_coordinator_mode()
+        engine.set_tools(_build_tools_for_mode(enabled))
+        engine.system_prompt = _build_system_prompt_for_mode(enabled)
+        if session_store is not None:
+            session_store.mode = current_session_mode()
+        return warning
 
     # Handle --resume
     if args.resume and session_store is not None:
@@ -394,14 +658,21 @@ def main() -> None:
                     target = m
                     break
         if target:
-            msgs = SessionStore.load_messages(target.session_id, cwd)
+            meta, msgs = SessionStore.load_session(target.session_id, cwd)
             if msgs:
+                warning = _apply_session_mode(meta.mode if meta is not None else None)
                 engine.set_messages(msgs)
-                session_store = SessionStore(cwd=cwd, model=app_config.model,
-                                            session_id=target.session_id)
+                session_store = SessionStore(
+                    cwd=cwd,
+                    model=app_config.model,
+                    session_id=target.session_id,
+                    mode=current_session_mode(),
+                )
                 engine.set_session_store(session_store)
                 console.print(f"[green]✓[/green] Resumed: {target.title[:50]}  "
                               f"({len(msgs)} messages)")
+                if warning:
+                    console.print(f"[yellow]{warning}[/yellow]")
         else:
             console.print(f"[red]Session not found: {args.resume}[/red]")
 
@@ -409,33 +680,50 @@ def main() -> None:
     if args.print or args.prompt:
         prompt_text = args.prompt or sys.stdin.read()
         run_query(engine, _parse_input(prompt_text), print_mode=args.print, permissions=permissions)
+        if worker_manager.has_running_tasks():
+            console.print(
+                "\n[dim]Background workers are still running. Use interactive mode "
+                "to receive coordinator task notifications.[/dim]"
+            )
         if cost_tracker.total_cost_usd > 0:
             console.print(f"\n[dim]{cost_tracker.format_cost()}[/dim]")
         return
 
     # Interactive REPL
-    config_note = f"[dim]{app_config.model} · max_tokens={app_config.max_tokens}[/dim]"
+    config_note = (
+        f"[dim]{app_config.provider}:{app_config.model} · "
+        f"max_tokens={app_config.max_tokens}[/dim]"
+    )
+    if is_coordinator_mode():
+        config_note += " [dim yellow]· coordinator[/dim yellow]"
     session_note = f"[dim]session {session_store.session_id[:8]}[/dim]" if session_store else ""
     console.print("[bold cyan]cc-mini[/bold cyan]  "
-                  f"{config_note}  {session_note}  "
-                  "[dim]Esc or Ctrl+C to cancel, Ctrl+C twice to exit[/dim]")
-    console.print('[dim]Enter to send, Alt+Enter for newline, /help for commands[/dim]\n')
+                  f"{config_note}  {session_note}")
+    console.print('[dim]Esc or Ctrl+C to cancel, Ctrl+C twice to exit[/dim]')
 
-    kb = KeyBindings()
-
-    @kb.add("escape", "enter")
-    def _(event):
-        event.current_buffer.insert_text("\n")
-
-    session: PromptSession = PromptSession(
-        history=FileHistory(str(_HISTORY_FILE)),
-        key_bindings=kb,
-        completer=_slash_completer,
-        complete_while_typing=True,
-    )
+    _file_history = FileHistory(str(_HISTORY_FILE))
 
     # Track last Ctrl+C time for double-press exit (matches useDoublePress)
     last_ctrlc_time = 0.0
+
+    # Terminal mode state — shared mutable ref toggled by "!" key binding
+    _terminal_mode_ref = [False]
+
+    def _run_shell(cmd: str) -> None:
+        """Execute a shell command and print output."""
+        import subprocess
+        console.print(f"[dim]$ {cmd}[/dim]")
+        try:
+            result = subprocess.run(
+                cmd, shell=True, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            if result.stdout:
+                console.print(result.stdout, end="", markup=False)
+            if result.returncode != 0:
+                console.print(f"[red][exit {result.returncode}][/red]")
+        except Exception as exc:
+            console.print(f"[red]Error: {exc}[/red]")
 
     # Companion animator — drives real-time idle animation in bottom_toolbar
     # Matches CompanionSprite.tsx tick-based animation system
@@ -450,12 +738,6 @@ def main() -> None:
                 animator = CompanionAnimator(comp)
     except Exception:
         pass
-
-    def _bottom_toolbar():
-        """Return animated companion sprite for bottom_toolbar."""
-        if animator is None:
-            return None
-        return animator.toolbar_text()
 
     def _set_reaction(text: str, print_to_terminal: bool = False) -> None:
         """Observer callback — delivers reaction to animator's toolbar bubble.
@@ -483,7 +765,20 @@ def main() -> None:
             except Exception:
                 pass
 
+    def _drain_worker_notifications() -> None:
+        if not is_coordinator_mode():
+            return
+        while True:
+            notifications = worker_manager.drain_notifications()
+            if not notifications:
+                return
+            for notification in notifications:
+                console.print("\n[dim]Worker update received.[/dim]")
+                run_query(engine, notification, print_mode=False, permissions=permissions)
+
     while True:
+        _drain_worker_notifications()
+
         # Start/restart animator before each prompt (picks up newly hatched companions)
         if animator is None:
             try:
@@ -500,17 +795,15 @@ def main() -> None:
         try:
             if animator:
                 animator.start()
-            # Override default bottom-toolbar reverse-video background
-            # so sprite and bubble render with normal terminal colors
-            _toolbar_style = PTStyle.from_dict({
-                'bottom-toolbar': 'noreverse',
-                'bottom-toolbar.text': '',
-            })
-            user_input = session.prompt(
-                "\n> ",
-                bottom_toolbar=_bottom_toolbar if animator else None,
+            console.print()
+            _terminal_mode_ref[0] = False  # always start in chat mode
+            user_input = _bordered_prompt(
+                console,
+                history=_file_history,
+                completer=_slash_completer,
+                animator_toolbar=animator.toolbar_text if animator else None,
                 refresh_interval=0.5 if animator else None,
-                style=_toolbar_style if animator else None,
+                terminal_mode_ref=_terminal_mode_ref,
             ).strip()
         except KeyboardInterrupt:
             now = time.monotonic()
@@ -536,6 +829,19 @@ def main() -> None:
 
         if not user_input:
             continue
+
+        # ---------------------------------------------------------------------------
+        # Terminal mode — "!" key toggles mode in-place (no submit needed).
+        # In terminal mode every submitted input is a shell command.
+        # Outside terminal mode "!cmd" runs a one-off shell command.
+        # ---------------------------------------------------------------------------
+        if _terminal_mode_ref[0]:
+            _run_shell(user_input)
+            continue
+
+        if user_input.startswith("!") and len(user_input) > 1:
+            _run_shell(user_input[1:].lstrip())
+            continue
         if user_input.lower() in ("exit", "quit", "/exit", "/quit"):
             console.print("[dim]Goodbye.[/dim]")
             break
@@ -553,7 +859,12 @@ def main() -> None:
             # /buddy is handled separately (companion pet)
             if cmd_name == "buddy":
                 from .buddy.commands import handle_buddy_command
-                handle_buddy_command(cmd_args, engine._client, console)
+                handle_buddy_command(
+                    cmd_args,
+                    engine._client,
+                    console,
+                    app_config.buddy_model or app_config.model,
+                )
                 # Refresh animator in case companion was just hatched
                 try:
                     from .buddy.companion import get_companion
@@ -574,7 +885,12 @@ def main() -> None:
                 permissions=permissions,
                 run_dream=lambda: _run_dream(engine, memory_dir, permissions),
                 cost_tracker=cost_tracker,
-                new_session_store=lambda: SessionStore(cwd=cwd, model=app_config.model),
+                new_session_store=lambda: SessionStore(
+                    cwd=cwd,
+                    model=app_config.model,
+                    mode=current_session_mode(),
+                ),
+                reconfigure_mode=_apply_session_mode,
             )
             handle_command(cmd_name, cmd_args, cmd_ctx)
             session_store = cmd_ctx.session_store
@@ -610,6 +926,7 @@ def main() -> None:
                         reply_event.set()
                     fire_companion_observer(
                         '', comp, engine._client, _direct_reply,
+                        model=app_config.buddy_model or app_config.model,
                         user_msg=user_input,
                     )
                     reply_event.wait(timeout=10)
@@ -620,6 +937,7 @@ def main() -> None:
             continue
 
         run_query(engine, _parse_input(user_input), print_mode=False, permissions=permissions)
+        _drain_worker_notifications()
 
         # Fire companion observer in background after each turn
         try:
@@ -647,6 +965,7 @@ def main() -> None:
                         if assistant_text.strip():
                             fire_companion_observer(
                                 assistant_text, comp, engine._client, _set_reaction,
+                                model=app_config.buddy_model or app_config.model,
                                 user_msg=user_input,
                             )
         except Exception:
@@ -696,7 +1015,8 @@ def _handle_sandbox_command(
     if subcmd == "status" or subcmd == "":
         _show_sandbox_status(mgr, con)
     elif subcmd == "exclude" and len(parts) > 2:
-        msg = mgr.add_excluded_command(parts[2])
+        pattern = parts[2].strip("\"'")
+        msg = mgr.add_excluded_command(pattern)
         mgr.save()
         con.print(f"[green]{msg}[/green]")
     elif subcmd == "mode" and len(parts) > 2:
