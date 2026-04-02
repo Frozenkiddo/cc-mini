@@ -13,6 +13,7 @@ from rich.text import Text
 
 from .sprites import render_face, render_sprite
 from .types import (
+    MOOD_DIMENSIONS,
     RARITY_COLORS,
     RARITY_STARS,
     STAT_NAMES,
@@ -20,6 +21,8 @@ from .types import (
     CompanionBones,
     CompanionSoul,
 )
+
+from rich.table import Table
 
 
 def _stat_bar(value: int, width: int = 20) -> str:
@@ -65,6 +68,16 @@ def render_companion_card(companion: Companion, console: Console) -> None:
         val = companion.stats.get(stat, 0)
         bar = _stat_bar(val)
         lines.append(f'  {stat:<10} {bar} {val:>3}')
+
+    # Mood
+    lines.append('')
+    lines.append('  Mood:')
+    mood = companion.mood
+    for dim in MOOD_DIMENSIONS:
+        val = getattr(mood, dim)
+        bar = _stat_bar(val)
+        lines.append(f'  {dim.capitalize():<10} {bar} {val:>3}')
+    lines.append(f'  Feeling: {mood.dominant().lower()}')
 
     # Hatched date
     from datetime import datetime, timezone
@@ -208,7 +221,8 @@ def render_compact_status(companion: Companion) -> str:
     )
     stars = RARITY_STARS.get(companion.rarity, '\u2605')
     shiny = ' \u2728' if companion.shiny else ''
-    return f'  {face} {companion.name} the {companion.species} {stars}{shiny}'
+    dominant = companion.mood.dominant().lower()
+    return f'  {face} {companion.name} the {companion.species} {stars}{shiny} ({dominant})'
 
 
 def render_speech_bubble(text: str, color: str = 'dim') -> str:
@@ -262,3 +276,43 @@ def render_speech_bubble_rich(
         padding=(0, 1),
     )
     console.print(panel)
+
+
+def render_companion_list(
+    companions: list[Companion], active_index: int, console: Console
+) -> None:
+    """Render a table of all owned companions (仓库)."""
+    if not companions:
+        console.print('[dim]No companions yet. Type /buddy to hatch one![/dim]')
+        return
+
+    table = Table(title='Companion Collection', border_style='dim', padding=(0, 1))
+    table.add_column('#', style='dim', width=3)
+    table.add_column('Name', min_width=12)
+    table.add_column('Species', min_width=10)
+    table.add_column('Rarity', min_width=10)
+    table.add_column('Face', min_width=8)
+    table.add_column('Shiny', width=5)
+
+    for i, comp in enumerate(companions):
+        color = RARITY_COLORS.get(comp.rarity, 'dim')
+        stars = RARITY_STARS.get(comp.rarity, '\u2605')
+        face = render_face(
+            CompanionBones(
+                rarity=comp.rarity, species=comp.species,
+                eye=comp.eye, hat=comp.hat,
+                shiny=comp.shiny, stats=comp.stats,
+            )
+        )
+        marker = '\u25b6' if i == active_index else ' '
+        shiny_mark = '\u2728' if comp.shiny else ''
+        table.add_row(
+            f'{marker}{i + 1}',
+            f'[{color}]{comp.name}[/{color}]',
+            comp.species,
+            f'[{color}]{stars} {comp.rarity}[/{color}]',
+            face,
+            shiny_mark,
+        )
+
+    console.print(table)

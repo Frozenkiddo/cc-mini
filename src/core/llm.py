@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 import anthropic
+import httpx
 
 
 _OPENAI_IMPORT_ERROR: Exception | None = None
@@ -157,6 +158,8 @@ class LLMClient:
         return isinstance(exc, anthropic.AuthenticationError)
 
     def is_retryable_error(self, exc: Exception) -> bool:
+        if isinstance(exc, (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError)):
+            return True
         if self.provider == _OPENAI_PROVIDER:
             return openai is not None and isinstance(
                 exc,
@@ -193,13 +196,16 @@ class LLMClient:
         system: str | None,
         tools: list[dict[str, Any]] | None,
     ) -> LLMMessage:
-        response = self._client.messages.create(
+        kwargs: dict[str, Any] = dict(
             model=model,
             max_tokens=max_tokens,
-            system=system,
-            tools=tools or None,
             messages=messages,
         )
+        if system:
+            kwargs["system"] = system
+        if tools:
+            kwargs["tools"] = tools
+        response = self._client.messages.create(**kwargs)
         usage = _usage_from_anthropic(getattr(response, "usage", None))
         return LLMMessage(
             content=_normalize_anthropic_content(getattr(response, "content", [])),
